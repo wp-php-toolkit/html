@@ -37,5 +37,10 @@
             "/Tests/",
             "/html5-named-character-references.php"
         ]
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-codex/replace-structured-url-bases": "0.8.x-dev"
+        }
     }
 }

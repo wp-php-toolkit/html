@@ -2760,6 +2760,165 @@ class WP_HTML_PHP_Tag_Processor {
 	}
 
 	/**
+	 * Replaces ranges inside an existing attribute value without rewriting it.
+	 *
+	 * Offsets refer to the decoded value returned by get_attribute(). Character
+	 * references outside the replaced ranges keep their original spelling. Every
+	 * range is resolved before any lexical update is queued, so a boundary inside
+	 * a character reference rejects the complete operation.
+	 *
+	 * @param string $name         Attribute name.
+	 * @param array  $replacements {
+	 *     Decoded attribute-value ranges to replace.
+	 *
+	 *     @type array ...$0 {
+	 *         One replacement.
+	 *
+	 *         @type int    $start       Decoded byte offset.
+	 *         @type int    $length      Decoded byte length.
+	 *         @type string $replacement Decoded replacement text.
+	 *     }
+	 * }
+	 * @return bool Whether all ranges were queued.
+	 */
+	protected function replace_attribute_value_ranges( $name, $replacements ) {
+		if (
+			self::STATE_MATCHED_TAG !== $this->parser_state ||
+			$this->is_closing_tag
+		) {
+			return false;
+		}
+
+		$comparable_name = strtolower( $name );
+		if (
+			! isset( $this->attributes[ $comparable_name ] ) ||
+			$this->attributes[ $comparable_name ]->is_true ||
+			isset( $this->lexical_updates[ $comparable_name ] )
+		) {
+			return false;
+		}
+
+		$decoded_value = $this->get_attribute( $name );
+		if ( ! is_string( $decoded_value ) || ! is_array( $replacements ) ) {
+			return false;
+		}
+
+		usort(
+			$replacements,
+			function ( $a, $b ) {
+				return $a['start'] - $b['start'];
+			}
+		);
+
+		$decoded_length = strlen( $decoded_value );
+		$previous_end   = 0;
+		$boundaries     = array();
+		foreach ( $replacements as $replacement ) {
+			if (
+				! is_array( $replacement ) ||
+				! isset( $replacement['start'], $replacement['length'], $replacement['replacement'] ) ||
+				! is_int( $replacement['start'] ) ||
+				! is_int( $replacement['length'] ) ||
+				! is_string( $replacement['replacement'] ) ||
+				0 > $replacement['start'] ||
+				0 > $replacement['length'] ||
+				$replacement['start'] < $previous_end ||
+				$replacement['start'] + $replacement['length'] > $decoded_length
+			) {
+				return false;
+			}
+
+			$previous_end = $replacement['start'] + $replacement['length'];
+			$boundaries[] = $replacement['start'];
+			$boundaries[] = $previous_end;
+		}
+
+		$updated_value = $decoded_value;
+		foreach ( array_reverse( $replacements ) as $replacement ) {
+			$updated_value = substr_replace(
+				$updated_value,
+				$replacement['replacement'],
+				$replacement['start'],
+				$replacement['length']
+			);
+		}
+
+		if (
+			in_array( $comparable_name, wp_kses_uri_attributes(), true ) &&
+			'' !== $updated_value &&
+			'' === esc_url( $updated_value )
+		) {
+			return false;
+		}
+
+		$attribute = $this->attributes[ $comparable_name ];
+		$raw_value = substr( $this->html, $attribute->value_starts_at, $attribute->value_length );
+		sort( $boundaries, SORT_NUMERIC );
+		$boundaries  = array_values( array_unique( $boundaries ) );
+		$raw_offsets = array();
+		$raw_at      = 0;
+		$decoded_at  = 0;
+		foreach ( $boundaries as $boundary ) {
+			while ( $decoded_at < $boundary ) {
+				if ( $raw_at >= strlen( $raw_value ) ) {
+					return false;
+				}
+
+				$raw_unit_length     = 1;
+				$decoded_unit_length = 1;
+				if ( '&' === $raw_value[ $raw_at ] ) {
+					$matched_byte_length = null;
+					$decoded_reference   = WP_HTML_Decoder::read_character_reference(
+						'attribute',
+						$raw_value,
+						$raw_at,
+						$matched_byte_length
+					);
+					if ( is_string( $decoded_reference ) ) {
+						$raw_unit_length     = $matched_byte_length;
+						$decoded_unit_length = strlen( $decoded_reference );
+					}
+				}
+
+				if ( $decoded_at + $decoded_unit_length > $boundary ) {
+					return false;
+				}
+				$raw_at     += $raw_unit_length;
+				$decoded_at += $decoded_unit_length;
+			}
+			$raw_offsets[ $boundary ] = $raw_at;
+		}
+
+		$is_unquoted = ! in_array( $this->html[ $attribute->value_starts_at - 1 ] ?? '', array( '"', "'" ), true );
+		$updates     = array();
+		foreach ( $replacements as $replacement ) {
+			$raw_start        = $raw_offsets[ $replacement['start'] ];
+			$raw_end          = $raw_offsets[ $replacement['start'] + $replacement['length'] ];
+			$replacement_text = esc_attr( $replacement['replacement'] );
+			if ( $is_unquoted ) {
+				$replacement_text = preg_replace_callback(
+					'/[\x09\x0A\x0C\x0D\x20`=]/',
+					function ( $matched_character ) {
+						return sprintf( '&#x%X;', ord( $matched_character[0] ) );
+					},
+					$replacement_text
+				);
+			}
+			$updates[] = new WP_HTML_Text_Replacement(
+				$attribute->value_starts_at + $raw_start,
+				$raw_end - $raw_start,
+				$replacement_text
+			);
+		}
+
+		foreach ( $updates as $update ) {
+			$this->lexical_updates[] = $update;
+		}
+
+		return true;
+	}
+
+	/**
 	 * Gets lowercase names of all attributes matching a given prefix in the current tag.
 	 *
 	 * Note that matching is case-insensitive. This is in accordance with the spec:
